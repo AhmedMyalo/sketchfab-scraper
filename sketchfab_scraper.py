@@ -70,6 +70,18 @@ SHARD_MAX_ROWS = 8000  # same reasoning as CGTrader: keep every file well under
 MAX_ATTEMPTS = 5
 BACKOFF = [3, 8, 20, 45, 90]
 
+# Separate, much larger budget specifically for 429. Live evidence (two
+# categories, two different steady-state request rates, both blocked at
+# right around 4,800 models = 200 requests) points to a FIXED REQUEST-COUNT
+# quota, not a requests/second throttle -- slowing down the delay between
+# requests does not help avoid it, only waiting for the quota window to
+# roll over does. The first attempt at 30s-8min (5 tries, ~15.5min total)
+# was not enough: still 429 after the full ladder, meaning the real window
+# is longer than 15.5 minutes. This ladder gives ~70 minutes of cumulative
+# patience, comfortably covering a 1-hour quota window if that is what it
+# is, while still recovering fast if the real window turns out shorter.
+RATE_LIMIT_MAX_ATTEMPTS = 7
+
 _stop = False
 
 
@@ -86,42 +98,64 @@ def jittered_sleep(base):
     time.sleep(max(0.0, base + random.uniform(-base * 0.3, base * 0.3)))
 
 
-RATE_LIMIT_BACKOFF = [30, 60, 120, 240, 480]  # a 429 is the server explicitly
-# saying "slow down" -- burning through the same 5-90s ladder used for random
-# network blips just re-hits the limit five times in under three minutes
-# (this is exactly what happened in the first live run: 5 attempts, all 429,
-# in well under a minute, then the whole category crashed). A 429 deserves
-# real, escalating patience, and any Retry-After header the server sends is
-# authoritative over both ladders.
+RATE_LIMIT_BACKOFF = [60, 120, 300, 600, 900, 900, 900]  # ~70 min cumulative.
+# The first fix (30s-8min, 5 tries, ~15.5min total) was verified live and was
+# STILL not enough: two categories, run independently at two different
+# steady-state request rates (130k/h then 60k/h), both got blocked at right
+# around 4,800 models = 200 requests either way -- the request RATE clearly
+# doesn't matter, only the total count does, which means this is a fixed
+# quota with a rollover window, not a requests/second throttle, and 15.5min
+# of patience wasn't long enough to see it roll over. This ladder assumes the
+# window could be as long as roughly an hour and waits that out; any
+# Retry-After header the server sends is authoritative over the ladder.
+
+
+def _request_once(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
 def _get(url):
-    """GET a URL, retrying on transient failures. Raises on a real HTTP error
-    that persists past all retries so the caller can decide what to do."""
+    """GET a URL. 404 -> None (genuinely gone). A 429 gets its own dedicated,
+    much longer retry budget (RATE_LIMIT_MAX_ATTEMPTS / RATE_LIMIT_BACKOFF) --
+    entirely separate from ordinary network-blip retries (MAX_ATTEMPTS /
+    BACKOFF), because the two situations need very different patience.
+    A `for attempt in range(N)` loop can't do this correctly: reassigning
+    `attempt` inside the loop body doesn't affect the range iterator's next
+    value, so an early version of this that tried to "not spend the ordinary
+    budget on a 429" that way was a silent no-op. Two independent counters
+    in a while loop actually decouples them."""
+    ordinary_attempt = 0
+    rate_limit_attempt = 0
     last_exc = None
-    for attempt in range(MAX_ATTEMPTS):
+    while True:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return json.loads(r.read().decode("utf-8"))
+            return _request_once(url)
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None  # genuinely gone/never existed -- not a retry case
             last_exc = e
             if e.code == 429:
+                if rate_limit_attempt >= RATE_LIMIT_MAX_ATTEMPTS:
+                    raise
                 retry_after = e.headers.get("Retry-After") if e.headers else None
                 wait = float(retry_after) if retry_after and retry_after.isdigit() \
-                    else RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
+                    else RATE_LIMIT_BACKOFF[min(rate_limit_attempt, len(RATE_LIMIT_BACKOFF) - 1)]
+                rate_limit_attempt += 1
                 print(f"    429 rate-limited -- backing off {wait:.0f}s "
-                      f"({attempt + 1}/{MAX_ATTEMPTS}, Retry-After={retry_after})")
+                      f"({rate_limit_attempt}/{RATE_LIMIT_MAX_ATTEMPTS}, Retry-After={retry_after})")
                 time.sleep(wait)
                 continue
         except Exception as e:
             last_exc = e
-        wait = BACKOFF[min(attempt, len(BACKOFF) - 1)]
-        print(f"    {type(last_exc).__name__}: {last_exc} -- retry in {wait}s ({attempt + 1}/{MAX_ATTEMPTS})")
+        if ordinary_attempt >= MAX_ATTEMPTS - 1:
+            raise last_exc
+        wait = BACKOFF[min(ordinary_attempt, len(BACKOFF) - 1)]
+        print(f"    {type(last_exc).__name__}: {last_exc} -- retry in {wait}s "
+              f"({ordinary_attempt + 1}/{MAX_ATTEMPTS})")
         time.sleep(wait)
-    raise last_exc
+        ordinary_attempt += 1
 
 
 # ---------------------------------------------------------------------------
