@@ -27,16 +27,18 @@ jobs:
   list:
     strategy:
       fail-fast: false
-      # Learned the hard way on the first real run: 18 categories fully
-      # parallel, each at ~0.35s delay, produced enough AGGREGATE request
-      # volume (plausibly from a shared GitHub-runner IP range) to trip
-      # Sketchfab's rate limiting -- HTTP 429 after ~4,800 models in the one
-      # job whose log was inspected, well within the first few minutes. The
-      # 10-request burst test done before writing any code was not enough
-      # evidence; sustained multi-job load is a different regime. Capping
-      # concurrency here, together with a longer per-request delay below,
-      # keeps aggregate load low while this gets re-verified for real.
-      max-parallel: 3
+      # Was capped at 3, on the theory that aggregate load across parallel
+      # jobs was what tripped the 429s. Real evidence from run #5 says
+      # otherwise: 'architecture' and 'art-abstract' each independently hit
+      # 429 at their OWN ~4,800-model mark while running side by side -- the
+      # same threshold, same timing, no sign either one's block was affected
+      # by the other. That's what a PER-JOB (likely per-runner-IP) quota
+      # looks like, not a shared aggregate one. The actual reason zero data
+      # ever landed for so long was the git-add bug (see commit 7357b2c), not
+      # concurrency. Raised back toward the original 18 so more categories
+      # can each independently make their own progress-then-wait cycle in
+      # parallel, since one job's 429 doesn't cost its siblings anything.
+      max-parallel: 9
       matrix:
         category:
           - animals-pets
