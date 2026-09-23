@@ -1,0 +1,235 @@
+name: Sketchfab scrape
+
+# Runs on GitHub's own runners -- never the user's machine, never the user's
+# personal IP -- exactly the isolation the CGTrader sibling project used.
+# No browser/WAF-solving step exists here at all (unlike CGTrader): Sketchfab's
+# /v3 endpoints are a plain, unauthenticated JSON API, confirmed empirically
+# with no challenge and no rate limiting observed. So this workflow is just
+# "run a Python script politely," nothing more.
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  list:
+    strategy:
+      fail-fast: false
+      matrix:
+        category:
+          - animals-pets
+          - architecture
+          - art-abstract
+          - cars-vehicles
+          - characters-creatures
+          - cultural-heritage-history
+          - electronics-gadgets
+          - fashion-style
+          - food-drink
+          - furniture-home
+          - music
+          - nature-plants
+          - news-politics
+          - people
+          - places-travel
+          - science-technology
+          - sports-fitness
+          - weapons-military
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    concurrency:
+      group: sketchfab-list-${{ matrix.category }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 300
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: List ${{ matrix.category }} in chunks, committing after each
+        run: |
+          set -u
+          CHUNK_MIN=20
+          TOTAL_MIN=180
+          deadline=$(( $(date +%s) + TOTAL_MIN * 60 ))
+
+          chunk_no=0
+          while :; do
+            if [ -f "sketchfab_raw/${{ matrix.category }}.complete" ]; then
+              echo "[chunk] ${{ matrix.category }} listing already complete"
+              break
+            fi
+            now=$(date +%s)
+            left_min=$(( (deadline - now) / 60 ))
+            if [ "$left_min" -lt 3 ]; then
+              echo "[chunk] listing budget exhausted for this run"
+              break
+            fi
+            this_chunk=$CHUNK_MIN
+            [ "$left_min" -lt "$CHUNK_MIN" ] && this_chunk=$left_min
+
+            chunk_no=$(( chunk_no + 1 ))
+            echo "::group::chunk $chunk_no (${this_chunk}min, ${left_min}min left)"
+            python sketchfab_scraper.py --list-category "${{ matrix.category }}" \
+              --delay 0.35 --max-minutes "$this_chunk"
+            rc=$?
+            echo "::endgroup::"
+
+            bash commit_progress.sh "list-${{ matrix.category }}"
+
+            if [ "$rc" -ne 0 ]; then
+              echo "::warning::listing exited $rc on chunk $chunk_no; progress pushed, stopping this job"
+              exit "$rc"
+            fi
+          done
+
+  detail:
+    needs: list
+    if: always()   # partial listing progress is still worth detailing;
+    # one category's listing job having a bad day must not block detail
+    # work on everything that WAS listed successfully
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    concurrency:
+      group: sketchfab-detail
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out the repo (latest, after all listing pushes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 300
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch model detail + comments in chunks, committing after each
+        run: |
+          set -u
+          CHUNK_MIN=20
+          TOTAL_MIN=180
+          deadline=$(( $(date +%s) + TOTAL_MIN * 60 ))
+
+          chunk_no=0
+          while :; do
+            now=$(date +%s)
+            left_min=$(( (deadline - now) / 60 ))
+            if [ "$left_min" -lt 3 ]; then
+              echo "[chunk] detail budget exhausted for this run"
+              break
+            fi
+            this_chunk=$CHUNK_MIN
+            [ "$left_min" -lt "$CHUNK_MIN" ] && this_chunk=$left_min
+
+            chunk_no=$(( chunk_no + 1 ))
+            echo "::group::chunk $chunk_no (${this_chunk}min, ${left_min}min left)"
+            python sketchfab_scraper.py --detail --delay 0.35 --max-minutes "$this_chunk" \
+              | tee /tmp/detail_chunk.log
+            rc=$?
+            echo "::endgroup::"
+
+            bash commit_progress.sh "detail"
+
+            if [ "$rc" -ne 0 ]; then
+              echo "::warning::detail pass exited $rc on chunk $chunk_no; progress pushed, stopping this job"
+              exit "$rc"
+            fi
+            # The script prints this and exits 0 with nothing left to do when
+            # every currently-known model has already been detailed. That's
+            # this run's real "done" signal, not a fixed chunk count.
+            if grep -q "0 unique models discovered\|0 to fetch" /tmp/detail_chunk.log; then
+              echo "[chunk] no models left to detail"
+              break
+            fi
+          done
+
+      - name: Export CSVs
+        if: always()
+        run: python sketchfab_scraper.py --export
+
+      - name: Upload CSV export
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sketchfab-csv-${{ github.run_number }}
+          path: |
+            sketchfab_models.csv
+            sketchfab_comments.csv
+          if-no-files-found: warn
+          retention-days: 90
+
+  check-completion:
+    needs: detail
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out the repo (latest)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compute overall progress
+        id: progress
+        run: python check_completion.py
+
+      - name: Open the "all done" issue, once
+        if: steps.progress.outputs.complete == 'true'
+        env:
+          # Values reach the script through env, never through raw ${{ }}
+          # interpolation -- the CGTrader project's completion step was
+          # broken exactly this way (a multi-line value pasted into a JS
+          # string literal is a guaranteed syntax error) until it was fixed.
+          PROGRESS_TABLE: ${{ steps.progress.outputs.table }}
+          TOTAL_DONE: ${{ steps.progress.outputs.total_done }}
+          TOTAL_TARGET: ${{ steps.progress.outputs.total_target }}
+          MISSING: ${{ steps.progress.outputs.missing }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "Sketchfab scrape complete (18/18 categories)";
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: "all", labels: "scrape-complete",
+            });
+            if (existing.length > 0) {
+              console.log("Completion issue already exists, not opening another.");
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title,
+              labels: ["scrape-complete"],
+              body: [
+                "Every category has been fully listed and every discovered",
+                "model has full detail + comments (or is confirmed gone).",
+                "",
+                `**${process.env.TOTAL_DONE} / ${process.env.TOTAL_TARGET}** models (${process.env.MISSING} unaccounted for)`,
+                "",
+                process.env.PROGRESS_TABLE,
+                "",
+                "The scheduled workflow will keep running every 6h (harmless,",
+                "finishes in well under a minute once nothing is left to do)",
+                "unless disabled from the Actions tab.",
+              ].join("\n"),
+            });
