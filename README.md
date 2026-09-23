@@ -9,9 +9,18 @@ GitHub Actions -- never on the owner's machine, never on the owner's IP.
 Sketchfab exposes a genuinely open, unauthenticated JSON API at
 `sketchfab.com/v3/*`. Confirmed empirically before writing any scraping code:
 no WAF/Cloudflare challenge on the data endpoints (only the docs/sitemap
-pages are protected), no rate limiting observed, and stable deep pagination.
-So there is no browser automation, no cookie-transplant trick, no WAF-solving
-step anywhere in this repo -- just polite plain HTTP.
+pages are protected), and stable deep pagination. So there is no browser
+automation, no cookie-transplant trick, no WAF-solving step anywhere in this
+repo -- just polite plain HTTP.
+
+There IS real rate limiting under sustained load, though, discovered the
+hard way on the first live run: a 10-request burst test beforehand showed
+nothing, but running all 18 categories fully in parallel produced HTTP 429s
+within minutes in every job that got far enough to hit it. The workflow now
+caps concurrency (`max-parallel: 3`) and uses a longer per-request delay;
+`_get()` in the scraper backs off much longer on a 429 specifically (30s-8min,
+honoring `Retry-After` if the server sends one) than on an ordinary network
+blip.
 
 Actual file downloads (STL/OBJ/etc.) require an authenticated Sketchfab
 account (`/download` returns 401 unauthenticated) and are out of scope here.

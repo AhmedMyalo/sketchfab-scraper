@@ -3,9 +3,11 @@ name: Sketchfab scrape
 # Runs on GitHub's own runners -- never the user's machine, never the user's
 # personal IP -- exactly the isolation the CGTrader sibling project used.
 # No browser/WAF-solving step exists here at all (unlike CGTrader): Sketchfab's
-# /v3 endpoints are a plain, unauthenticated JSON API, confirmed empirically
-# with no challenge and no rate limiting observed. So this workflow is just
-# "run a Python script politely," nothing more.
+# /v3 endpoints are a plain, unauthenticated JSON API with no challenge in
+# front of it. There IS real rate limiting under sustained load, though: a
+# 10-request burst test showed nothing, but the first live 18-way-parallel
+# run hit HTTP 429 within minutes in every job that got far enough to notice.
+# max-parallel and the per-request delay below are the response to that.
 on:
   schedule:
     - cron: "0 */6 * * *"
@@ -19,6 +21,16 @@ jobs:
   list:
     strategy:
       fail-fast: false
+      # Learned the hard way on the first real run: 18 categories fully
+      # parallel, each at ~0.35s delay, produced enough AGGREGATE request
+      # volume (plausibly from a shared GitHub-runner IP range) to trip
+      # Sketchfab's rate limiting -- HTTP 429 after ~4,800 models in the one
+      # job whose log was inspected, well within the first few minutes. The
+      # 10-request burst test done before writing any code was not enough
+      # evidence; sustained multi-job load is a different regime. Capping
+      # concurrency here, together with a longer per-request delay below,
+      # keeps aggregate load low while this gets re-verified for real.
+      max-parallel: 3
       matrix:
         category:
           - animals-pets
@@ -83,15 +95,26 @@ jobs:
             chunk_no=$(( chunk_no + 1 ))
             echo "::group::chunk $chunk_no (${this_chunk}min, ${left_min}min left)"
             python sketchfab_scraper.py --list-category "${{ matrix.category }}" \
-              --delay 0.35 --max-minutes "$this_chunk"
+              --delay 1.2 --max-minutes "$this_chunk"
             rc=$?
             echo "::endgroup::"
 
             bash commit_progress.sh "list-${{ matrix.category }}"
+            commit_rc=$?
 
             if [ "$rc" -ne 0 ]; then
-              echo "::warning::listing exited $rc on chunk $chunk_no; progress pushed, stopping this job"
+              echo "::warning::listing exited $rc on chunk $chunk_no"
               exit "$rc"
+            fi
+            if [ "$commit_rc" -ne 0 ]; then
+              # This was the real bug behind the first live run: 17/18 jobs
+              # showed green while pushing nothing, because this exit code
+              # was never checked. A push failure after 8 retries means this
+              # chunk's progress is sitting on the runner's disk only and is
+              # about to be thrown away when the job ends -- that MUST fail
+              # the job loudly, not report success.
+              echo "::error::push failed after retries on chunk $chunk_no -- this chunk's progress could not reach origin/main"
+              exit 1
             fi
           done
 
@@ -138,16 +161,21 @@ jobs:
 
             chunk_no=$(( chunk_no + 1 ))
             echo "::group::chunk $chunk_no (${this_chunk}min, ${left_min}min left)"
-            python sketchfab_scraper.py --detail --delay 0.35 --max-minutes "$this_chunk" \
+            python sketchfab_scraper.py --detail --delay 1.2 --max-minutes "$this_chunk" \
               | tee /tmp/detail_chunk.log
             rc=$?
             echo "::endgroup::"
 
             bash commit_progress.sh "detail"
+            commit_rc=$?
 
             if [ "$rc" -ne 0 ]; then
-              echo "::warning::detail pass exited $rc on chunk $chunk_no; progress pushed, stopping this job"
+              echo "::warning::detail pass exited $rc on chunk $chunk_no"
               exit "$rc"
+            fi
+            if [ "$commit_rc" -ne 0 ]; then
+              echo "::error::push failed after retries on chunk $chunk_no -- this chunk's progress could not reach origin/main"
+              exit 1
             fi
             # The script prints this and exits 0 with nothing left to do when
             # every currently-known model has already been detailed. That's

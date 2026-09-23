@@ -86,6 +86,15 @@ def jittered_sleep(base):
     time.sleep(max(0.0, base + random.uniform(-base * 0.3, base * 0.3)))
 
 
+RATE_LIMIT_BACKOFF = [30, 60, 120, 240, 480]  # a 429 is the server explicitly
+# saying "slow down" -- burning through the same 5-90s ladder used for random
+# network blips just re-hits the limit five times in under three minutes
+# (this is exactly what happened in the first live run: 5 attempts, all 429,
+# in well under a minute, then the whole category crashed). A 429 deserves
+# real, escalating patience, and any Retry-After header the server sends is
+# authoritative over both ladders.
+
+
 def _get(url):
     """GET a URL, retrying on transient failures. Raises on a real HTTP error
     that persists past all retries so the caller can decide what to do."""
@@ -99,6 +108,14 @@ def _get(url):
             if e.code == 404:
                 return None  # genuinely gone/never existed -- not a retry case
             last_exc = e
+            if e.code == 429:
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                wait = float(retry_after) if retry_after and retry_after.isdigit() \
+                    else RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
+                print(f"    429 rate-limited -- backing off {wait:.0f}s "
+                      f"({attempt + 1}/{MAX_ATTEMPTS}, Retry-After={retry_after})")
+                time.sleep(wait)
+                continue
         except Exception as e:
             last_exc = e
         wait = BACKOFF[min(attempt, len(BACKOFF) - 1)]
