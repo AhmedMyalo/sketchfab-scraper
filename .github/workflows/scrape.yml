@@ -9,14 +9,16 @@ name: Sketchfab scrape
 # run hit HTTP 429 within minutes in every job that got far enough to notice.
 # max-parallel and the per-request delay below are the response to that.
 on:
-  # The cron schedule is OFF for now, deliberately, while the very first
-  # live runs are still failing (429s + a repo-permissions issue being
-  # actively debugged). Leaving a broken workflow on a 6h auto-retry would
-  # just repeat the same failure unattended and add to Sketchfab's load for
-  # nothing. Re-enable (uncomment) once a run has been verified end to end
-  # to actually push data.
-  # schedule:
-  #   - cron: "0 */6 * * *"
+  # Re-enabled 2026-09-24: runs #5-#7 each completed cleanly end to end after
+  # the git-add fix (7357b2c) -- real listing data and real detail/comment
+  # data confirmed landing on main, no repeats of the earlier 429-crash or
+  # zero-commits failures. Each run only makes ~180min of progress before its
+  # own budget runs out, and nothing else was re-triggering it, so 6h auto-
+  # retry is what keeps this moving without needing a manual trigger every
+  # time. Harmless once there's genuinely nothing left to do -- a run with no
+  # new models to list or detail finishes in well under a minute.
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch: {}
 
 permissions:
