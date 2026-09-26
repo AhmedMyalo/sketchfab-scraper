@@ -134,10 +134,16 @@ jobs:
           done
 
   detail:
-    needs: list
-    if: always()   # partial listing progress is still worth detailing;
-    # one category's listing job having a bad day must not block detail
-    # work on everything that WAS listed successfully
+    # Deliberately NOT `needs: list`. That dependency meant detail waited for
+    # the ENTIRE 18-job listing matrix to reach a terminal state before doing
+    # a single model -- watched this cost over an hour of a run with the
+    # user's stated top priority (comments/detail) sitting completely idle
+    # while listing's first 9-wide batch was still stuck on its own 429
+    # waits. detail already reads whatever's on sketchfab_raw/*.jsonl at
+    # checkout time regardless of which run wrote it, so there's no reason
+    # for it to wait on THIS run's listing to finish -- it can start
+    # immediately on the 630k+ models already known from earlier cycles,
+    # and listing keeps discovering more in parallel for future cycles.
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
