@@ -391,10 +391,15 @@ def load_done_uids(details_dir):
 
 def load_targets():
     """Every uid discovered across all category listing files, with the set
-    of categories it was found in (a model can be in more than one)."""
+    of categories it was found in (a model can be in more than one), plus
+    commentCount/publishedAt from the SAME listing row -- both fields the
+    listing endpoint already returns for free, so a filter on either costs
+    nothing extra, unlike filtering on anything only the detail endpoint
+    reveals (which would require fetching detail first to find out)."""
     found_in = {}
+    meta = {}
     if not os.path.isdir(RAW_DIR):
-        return found_in
+        return found_in, meta
     for slug in CATEGORIES:
         p = os.path.join(RAW_DIR, f"{slug}.jsonl")
         if not os.path.exists(p):
@@ -411,7 +416,8 @@ def load_targets():
                 uid = r.get("uid")
                 if uid:
                     found_in.setdefault(uid, set()).add(slug)
-    return found_in
+                    meta[uid] = (r.get("commentCount") or 0, r.get("publishedAt") or "")
+    return found_in, meta
 
 
 # ---------------------------------------------------------------------------
@@ -444,12 +450,30 @@ def fetch_model_full(uid, found_in_categories):
     return row, comments
 
 
-def run_detail_pass(delay, max_minutes=None, shard=None):
-    found_in = load_targets()
+def run_detail_pass(delay, max_minutes=None, shard=None, require_comments=False, since=None):
+    found_in, meta = load_targets()
     if not found_in:
         raise SystemExit("no listing files found under sketchfab_raw/ -- run --list-category first")
     done = load_done_uids(DETAILS_DIR)
     todo = [uid for uid in found_in if uid not in done]
+
+    # Both filters read fields the LISTING response already carries for free
+    # (see load_targets) -- filtering here means a model we will never keep
+    # never costs a detail request in the first place, instead of fetching
+    # full detail just to find out it didn't qualify. Deadline-driven scope
+    # cut: of 876,830 models listed so far, only 178,626 have any comments
+    # at all, and only 152,808 of those are also within the last N years --
+    # an 83% reduction in detail requests needed for the same real priority
+    # (comments), not a smaller *sample* of it.
+    if require_comments:
+        before = len(todo)
+        todo = [uid for uid in todo if meta.get(uid, (0, ""))[0] > 0]
+        print(f"--require-comments: {len(todo)} of {before} outstanding models have commentCount > 0")
+    if since:
+        before = len(todo)
+        todo = [uid for uid in todo if meta.get(uid, (0, ""))[1][:10] >= since]
+        print(f"--since {since}: {len(todo)} of {before} outstanding models are recent enough")
+
     shard_i, shard_n, shard_tag = _parse_shard(shard)
     if shard_n > 1:
         # Partition on the uid itself, not on position in the list: todo
@@ -570,6 +594,12 @@ def main():
                          "shared, not per-category like listing's, so this is the "
                          "only way to run more than one detail worker at a time.")
     ap.add_argument("--export", action="store_true", help="rebuild CSVs from the JSONL shards")
+    ap.add_argument("--require-comments", action="store_true",
+                    help="--detail: skip models with commentCount == 0 in their listing "
+                         "row (free field, no extra request needed to check)")
+    ap.add_argument("--since", default=None, metavar="YYYY-MM-DD",
+                    help="--detail: skip models published before this date "
+                         "(publishedAt is also a free field from listing)")
     args = ap.parse_args()
 
     signal.signal(signal.SIGINT, _sigint)
@@ -587,7 +617,8 @@ def main():
         return
 
     if args.detail:
-        run_detail_pass(args.delay, args.max_minutes, shard=args.shard)
+        run_detail_pass(args.delay, args.max_minutes, shard=args.shard,
+                        require_comments=args.require_comments, since=args.since)
         return
 
     if args.export:

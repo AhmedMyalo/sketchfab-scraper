@@ -156,12 +156,16 @@ jobs:
         # waits and the time-budget rebalance were both fixed. Sharded the
         # same way the CGTrader sibling project split its last category:
         # partition by uid (see _shard_key), each shard gets its own
-        # concurrency group so up to 8 run genuinely in parallel. Evidence
+        # concurrency group so they run genuinely in parallel. Evidence
         # from the listing phase (architecture and art-abstract independently
         # hitting 429 at the same ~4,800-model mark with no sign of shared
         # contention) suggests the quota is per-job, so this should multiply
-        # throughput rather than just divide the same quota 8 ways.
-        shard: ["0/8", "1/8", "2/8", "3/8", "4/8", "5/8", "6/8", "7/8"]
+        # throughput rather than just divide the same quota N ways. Raised
+        # 8 -> 16 chasing a 2-day deadline: measured sharded rate was
+        # ~1,586 models/h at 8-wide; the reduced (--require-comments --since)
+        # backlog of ~110k needs roughly double that to fit in 48h.
+        shard: ["0/16", "1/16", "2/16", "3/16", "4/16", "5/16", "6/16", "7/16",
+                "8/16", "9/16", "10/16", "11/16", "12/16", "13/16", "14/16", "15/16"]
 
     concurrency:
       group: sketchfab-detail-${{ matrix.shard }}
@@ -201,7 +205,16 @@ jobs:
 
             chunk_no=$(( chunk_no + 1 ))
             echo "::group::chunk $chunk_no (${this_chunk}min, ${left_min}min left)"
+            # Both filters read fields the LISTING response already has for
+            # free (commentCount, publishedAt) -- see load_targets() in
+            # sketchfab_scraper.py. Deadline-driven scope cut agreed with the
+            # user: comments are the actual priority, not an exhaustive
+            # per-model catalog, and "last 3 years" is the recency window.
+            # This cuts the outstanding backlog from 876k+ down to ~110k
+            # (measured), an 83% reduction in detail requests needed for the
+            # SAME priority, not a smaller sample of it.
             python sketchfab_scraper.py --detail --shard "${{ matrix.shard }}" \
+              --require-comments --since 2023-09-26 \
               --delay 1.2 --max-minutes "$this_chunk" \
               | tee /tmp/detail_chunk.log
             rc=$?
