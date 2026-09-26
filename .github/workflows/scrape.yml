@@ -84,7 +84,12 @@ jobs:
         run: |
           set -u
           CHUNK_MIN=20
-          TOTAL_MIN=180
+          # Cut from 180: the user's priority is comments/detail, not
+          # finishing the listing phase fast. Listing is resumable (cursor
+          # persisted) and re-invoked every 6h by cron regardless, so a
+          # smaller budget here just means smaller bites per cycle, not
+          # lost progress -- it hands off to detail sooner within THIS run.
+          TOTAL_MIN=60
           deadline=$(( $(date +%s) + TOTAL_MIN * 60 ))
 
           chunk_no=0
@@ -155,7 +160,15 @@ jobs:
         run: |
           set -u
           CHUNK_MIN=20
-          TOTAL_MIN=180
+          # Raised from 180 toward the job's own 350min ceiling (timeout-
+          # minutes above), leaving ~30min headroom for checkout/export/
+          # upload. detail's concurrency group is a single shared one (not
+          # per-category like listing's), so only one detail job ever runs
+          # at a time regardless of how many workflow runs are queued --
+          # this is the one knob that controls how much of each 6h cron
+          # cycle is actually spent fetching model detail + comments, which
+          # is the priority now over how fast listing finishes.
+          TOTAL_MIN=320
           deadline=$(( $(date +%s) + TOTAL_MIN * 60 ))
 
           chunk_no=0
