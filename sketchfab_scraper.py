@@ -43,6 +43,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -315,29 +316,62 @@ def _shard_paths(d):
 
 
 class ShardedWriter:
-    def __init__(self, out_dir, max_rows=SHARD_MAX_ROWS):
+    """Cheap append-only writer. Optionally tagged so several parallel detail
+    workers can each own their own file series (part_sIofN_NNNNN.jsonl)
+    instead of racing on the same untagged one -- the same fix the CGTrader
+    project needed: an untagged writer's "is this file mine" check must be an
+    ANCHORED regex, or it will wrongly adopt a tagged sibling's files (and a
+    tagged writer must never adopt another tag's files either)."""
+
+    def __init__(self, out_dir, max_rows=SHARD_MAX_ROWS, tag=None):
         os.makedirs(out_dir, exist_ok=True)
         self.dir = out_dir
         self.max_rows = max_rows
-        shards = _shard_paths(out_dir)
-        if shards:
-            self.path = shards[-1]
-            self.index = len(shards)
+        self.tag = tag
+        self._mine = re.compile(
+            r"^part_\d+\.jsonl$" if tag is None
+            else rf"^part_{re.escape(tag)}_\d+\.jsonl$")
+        own = [p for p in _shard_paths(out_dir) if self._mine.match(os.path.basename(p))]
+        if own:
+            self.path = own[-1]
+            self.index = len(own)
             with open(self.path, encoding="utf-8") as f:
                 self.count = sum(1 for _ in f)
         else:
             self.index = 1
-            self.path = os.path.join(out_dir, f"part_{self.index:05d}.jsonl")
+            self.path = os.path.join(out_dir, self._name(self.index))
             self.count = 0
+
+    def _name(self, index):
+        prefix = "part_" if self.tag is None else f"part_{self.tag}_"
+        return f"{prefix}{index:05d}.jsonl"
 
     def append(self, row):
         if self.count >= self.max_rows:
             self.index += 1
-            self.path = os.path.join(self.dir, f"part_{self.index:05d}.jsonl")
+            self.path = os.path.join(self.dir, self._name(self.index))
             self.count = 0
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         self.count += 1
+
+
+def _shard_key(uid):
+    """Stable numeric key for partitioning a uid across N parallel workers."""
+    return zlib.crc32(uid.encode())
+
+
+def _parse_shard(spec):
+    """'3/8' -> (3, 8, 's3of8'). None -> (0, 1, None), i.e. take everything."""
+    if not spec:
+        return 0, 1, None
+    try:
+        i, n = (int(x) for x in spec.split("/", 1))
+    except ValueError:
+        raise SystemExit(f"--shard wants I/N (e.g. 3/8), got {spec!r}")
+    if n < 1 or not 0 <= i < n:
+        raise SystemExit(f"--shard {spec}: need 1 <= N and 0 <= I < N")
+    return i, n, (None if n == 1 else f"s{i}of{n}")
 
 
 def load_done_uids(details_dir):
@@ -410,19 +444,28 @@ def fetch_model_full(uid, found_in_categories):
     return row, comments
 
 
-def run_detail_pass(delay, max_minutes=None):
+def run_detail_pass(delay, max_minutes=None, shard=None):
     found_in = load_targets()
     if not found_in:
         raise SystemExit("no listing files found under sketchfab_raw/ -- run --list-category first")
     done = load_done_uids(DETAILS_DIR)
     todo = [uid for uid in found_in if uid not in done]
+    shard_i, shard_n, shard_tag = _parse_shard(shard)
+    if shard_n > 1:
+        # Partition on the uid itself, not on position in the list: todo
+        # shrinks as rows land, so a positional split would hand overlapping
+        # work to shards on the next invocation. Every shard reads the SAME
+        # done-set, so anything a sibling already wrote is skipped here too.
+        before = len(todo)
+        todo = [uid for uid in todo if _shard_key(uid) % shard_n == shard_i]
+        print(f"shard {shard_i}/{shard_n}: {len(todo)} of {before} outstanding models are mine")
     print(f"{len(found_in):,} unique models discovered across all categories, "
           f"{len(done):,} already fetched, {len(todo):,} to fetch")
     if not todo:
         return
 
-    writer = ShardedWriter(DETAILS_DIR)
-    cwriter = ShardedWriter(COMMENTS_DIR)
+    writer = ShardedWriter(DETAILS_DIR, tag=shard_tag)
+    cwriter = ShardedWriter(COMMENTS_DIR, tag=shard_tag)
     t0 = time.time()
     ok = failed = comments_total = 0
     for i, uid in enumerate(todo, 1):
@@ -521,6 +564,11 @@ def main():
     ap.add_argument("--test-uid", default=None, help="fetch and print one model's full detail + comments")
     ap.add_argument("--delay", type=float, default=0.4, help="avg seconds between requests")
     ap.add_argument("--max-minutes", type=float, default=None)
+    ap.add_argument("--shard", default=None, metavar="I/N",
+                    help="split --detail across N parallel workers, handle slice I "
+                         "(0-based), e.g. --shard 3/8. Detail's concurrency group is "
+                         "shared, not per-category like listing's, so this is the "
+                         "only way to run more than one detail worker at a time.")
     ap.add_argument("--export", action="store_true", help="rebuild CSVs from the JSONL shards")
     args = ap.parse_args()
 
@@ -539,7 +587,7 @@ def main():
         return
 
     if args.detail:
-        run_detail_pass(args.delay, args.max_minutes)
+        run_detail_pass(args.delay, args.max_minutes, shard=args.shard)
         return
 
     if args.export:

@@ -141,8 +141,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # detail was a SINGLE job with one shared concurrency group, meaning
+        # only one detail worker ever ran at a time no matter how many
+        # workflow runs were queued -- the actual bottleneck once the 429
+        # waits and the time-budget rebalance were both fixed. Sharded the
+        # same way the CGTrader sibling project split its last category:
+        # partition by uid (see _shard_key), each shard gets its own
+        # concurrency group so up to 8 run genuinely in parallel. Evidence
+        # from the listing phase (architecture and art-abstract independently
+        # hitting 429 at the same ~4,800-model mark with no sign of shared
+        # contention) suggests the quota is per-job, so this should multiply
+        # throughput rather than just divide the same quota 8 ways.
+        shard: ["0/8", "1/8", "2/8", "3/8", "4/8", "5/8", "6/8", "7/8"]
+
     concurrency:
-      group: sketchfab-detail
+      group: sketchfab-detail-${{ matrix.shard }}
       cancel-in-progress: false
 
     steps:
@@ -162,12 +178,7 @@ jobs:
           CHUNK_MIN=20
           # Raised from 180 toward the job's own 350min ceiling (timeout-
           # minutes above), leaving ~30min headroom for checkout/export/
-          # upload. detail's concurrency group is a single shared one (not
-          # per-category like listing's), so only one detail job ever runs
-          # at a time regardless of how many workflow runs are queued --
-          # this is the one knob that controls how much of each 6h cron
-          # cycle is actually spent fetching model detail + comments, which
-          # is the priority now over how fast listing finishes.
+          # upload. This is the priority now over how fast listing finishes.
           TOTAL_MIN=320
           deadline=$(( $(date +%s) + TOTAL_MIN * 60 ))
 
@@ -184,12 +195,13 @@ jobs:
 
             chunk_no=$(( chunk_no + 1 ))
             echo "::group::chunk $chunk_no (${this_chunk}min, ${left_min}min left)"
-            python sketchfab_scraper.py --detail --delay 1.2 --max-minutes "$this_chunk" \
+            python sketchfab_scraper.py --detail --shard "${{ matrix.shard }}" \
+              --delay 1.2 --max-minutes "$this_chunk" \
               | tee /tmp/detail_chunk.log
             rc=$?
             echo "::endgroup::"
 
-            bash commit_progress.sh "detail"
+            bash commit_progress.sh "detail-${{ matrix.shard }}"
             commit_rc=$?
 
             if [ "$rc" -ne 0 ]; then
@@ -201,17 +213,33 @@ jobs:
               exit 1
             fi
             # The script prints this and exits 0 with nothing left to do when
-            # every currently-known model has already been detailed. That's
-            # this run's real "done" signal, not a fixed chunk count.
-            if grep -q "0 unique models discovered\|0 to fetch" /tmp/detail_chunk.log; then
-              echo "[chunk] no models left to detail"
+            # every currently-known model in THIS shard has already been
+            # detailed. That's this run's real "done" signal, not a fixed
+            # chunk count.
+            if grep -q "0 unique models discovered\|0 to fetch\|0 of 0 outstanding" /tmp/detail_chunk.log; then
+              echo "[chunk] no models left to detail in this shard"
               break
             fi
           done
 
+      # Only one shard exports: it rebuilds the CSVs from every shard file
+      # on disk (all 8 workers' output), so running this in all 8 jobs would
+      # do the same expensive work 8 times and upload 8 artifacts under one
+      # name, which is an error, not a merge.
       - name: Export CSVs
-        if: always()
+        if: always() && startsWith(matrix.shard, '0/')
         run: python sketchfab_scraper.py --export
+
+      - name: Upload CSV export
+        if: always() && startsWith(matrix.shard, '0/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: sketchfab-csv-${{ github.run_number }}
+          path: |
+            sketchfab_models.csv
+            sketchfab_comments.csv
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Upload CSV export
         if: always()

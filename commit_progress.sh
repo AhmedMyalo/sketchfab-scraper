@@ -56,12 +56,23 @@ resolve_conflicts() {
   return $((1 - any))
 }
 
-for attempt in 1 2 3 4 5 6 7 8; do
+MAX_ATTEMPTS=20
+# Raised from 8/short-backoff after a real failure: list jobs run up to 9-way
+# parallel and many of them hit the SAME 429 wall at the SAME ~4,800-model
+# mark, so they tend to wake from their retry ladder and try to commit
+# within the same narrow window -- not evenly-distributed contention but a
+# synchronized burst. cultural-heritage-history's rebase succeeded cleanly
+# on every single one of 8 attempts (no real conflict, ever) but still lost
+# the push race every time within ~3.5min, because something else re-pushed
+# in the few seconds between its rebase finishing and its next push attempt.
+# More attempts with a wider, more randomized gap gives a much better chance
+# of landing in a gap between other jobs' pushes.
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
   if git push -q; then
-    echo "[commit] pushed $LABEL on attempt $attempt"
+    echo "[commit] pushed $LABEL on attempt $attempt/$MAX_ATTEMPTS"
     exit 0
   fi
-  echo "[commit] push rejected (attempt $attempt/8) -- fetching and rebasing"
+  echo "[commit] push rejected (attempt $attempt/$MAX_ATTEMPTS) -- fetching and rebasing"
   git fetch -q origin main
   if ! git rebase origin/main; then
     if resolve_conflicts; then
@@ -71,8 +82,9 @@ for attempt in 1 2 3 4 5 6 7 8; do
       echo "[commit] rebase failed with no conflicted files -- retrying"
     fi
   fi
-  sleep $((attempt * 6 + RANDOM % 8))
+  wait_s=$(( attempt < 10 ? attempt * 4 : 40 ))
+  sleep $(( wait_s + RANDOM % 15 ))
 done
 
-echo "::error::push still failing after 8 attempts for $LABEL -- this chunk's progress is committed LOCALLY on the runner but could not reach origin/main."
+echo "::error::push still failing after $MAX_ATTEMPTS attempts for $LABEL -- this chunk's progress is committed LOCALLY on the runner but could not reach origin/main."
 exit 1
