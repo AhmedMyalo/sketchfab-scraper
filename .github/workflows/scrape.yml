@@ -253,18 +253,15 @@ jobs:
         if: always() && startsWith(matrix.shard, '0/')
         uses: actions/upload-artifact@v4
         with:
-          name: sketchfab-csv-${{ github.run_number }}
-          path: |
-            sketchfab_models.csv
-            sketchfab_comments.csv
-          if-no-files-found: warn
-          retention-days: 90
-
-      - name: Upload CSV export
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sketchfab-csv-${{ github.run_number }}
+          # run_attempt included: a re-run of just this job would otherwise
+          # try to create an artifact with the same name the first attempt
+          # already created in this same run, which is exactly what caused
+          # detail (0/16)'s failure -- "(409) Conflict: an artifact with
+          # this name already exists on the workflow run" AFTER the real
+          # scraping work (fetch + commit) had already succeeded cleanly.
+          # Purely a reporting/upload-naming bug, not data loss: every
+          # commit in that job's log landed on main before this ran.
+          name: sketchfab-csv-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             sketchfab_models.csv
             sketchfab_comments.csv
