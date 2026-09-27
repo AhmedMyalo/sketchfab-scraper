@@ -450,7 +450,19 @@ def fetch_model_full(uid, found_in_categories):
     return row, comments
 
 
-def run_detail_pass(delay, max_minutes=None, shard=None, require_comments=False, since=None):
+def _in_random_sample(uid, pct):
+    """Deterministic hash-based coin flip, independent of _shard_key's hash
+    (different salt) so sampling and shard-partitioning never correlate.
+    Every worker computes this identically from the uid alone -- no shared
+    state or coordination needed for all shards to agree on the same sample,
+    and no ordering bias the way "take the first N encountered" would have
+    (todo's order tracks roughly newest-published-first, since that's how
+    listing walks each category)."""
+    return zlib.crc32((uid + "|sample").encode()) % 10000 < pct * 100
+
+
+def run_detail_pass(delay, max_minutes=None, shard=None, require_comments=False,
+                     since=None, sample_pct=None):
     found_in, meta = load_targets()
     if not found_in:
         raise SystemExit("no listing files found under sketchfab_raw/ -- run --list-category first")
@@ -473,6 +485,19 @@ def run_detail_pass(delay, max_minutes=None, shard=None, require_comments=False,
         before = len(todo)
         todo = [uid for uid in todo if meta.get(uid, (0, ""))[1][:10] >= since]
         print(f"--since {since}: {len(todo)} of {before} outstanding models are recent enough")
+
+    if sample_pct is not None:
+        # Fixed deadline, measured sustained rate way under what "detail
+        # everything that qualifies" needs. Rather than let the deadline
+        # arrive and cut off whatever order happened to get processed first
+        # (biased toward newer-published models, since that's listing's
+        # order), draw a clean random subsample now, sized to what the
+        # measured rate can actually finish -- so the final dataset is an
+        # honest random sample of the qualifying population, not an
+        # artifact of processing order.
+        before = len(todo)
+        todo = [uid for uid in todo if _in_random_sample(uid, sample_pct)]
+        print(f"--sample-pct {sample_pct}: {len(todo)} of {before} outstanding models drawn")
 
     shard_i, shard_n, shard_tag = _parse_shard(shard)
     if shard_n > 1:
@@ -600,6 +625,11 @@ def main():
     ap.add_argument("--since", default=None, metavar="YYYY-MM-DD",
                     help="--detail: skip models published before this date "
                          "(publishedAt is also a free field from listing)")
+    ap.add_argument("--sample-pct", type=float, default=None, metavar="PCT",
+                    help="--detail: only keep a random PCT%% of the models that "
+                         "pass the other filters, sized to a fixed deadline. "
+                         "Deterministic per-uid hash, so every shard agrees on "
+                         "the same sample with no coordination needed.")
     args = ap.parse_args()
 
     signal.signal(signal.SIGINT, _sigint)
@@ -618,7 +648,8 @@ def main():
 
     if args.detail:
         run_detail_pass(args.delay, args.max_minutes, shard=args.shard,
-                        require_comments=args.require_comments, since=args.since)
+                        require_comments=args.require_comments, since=args.since,
+                        sample_pct=args.sample_pct)
         return
 
     if args.export:

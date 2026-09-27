@@ -205,16 +205,25 @@ jobs:
 
             chunk_no=$(( chunk_no + 1 ))
             echo "::group::chunk $chunk_no (${this_chunk}min, ${left_min}min left)"
-            # Both filters read fields the LISTING response already has for
+            # comments/since read fields the LISTING response already has for
             # free (commentCount, publishedAt) -- see load_targets() in
-            # sketchfab_scraper.py. Deadline-driven scope cut agreed with the
-            # user: comments are the actual priority, not an exhaustive
-            # per-model catalog, and "last 3 years" is the recency window.
-            # This cuts the outstanding backlog from 876k+ down to ~110k
-            # (measured), an 83% reduction in detail requests needed for the
-            # SAME priority, not a smaller sample of it.
+            # sketchfab_scraper.py: comments are the actual priority, not an
+            # exhaustive per-model catalog, and "last 3 years" is the recency
+            # window. That alone cuts 876k+ down to ~110k (measured).
+            #
+            # --sample-pct added after the deadline stayed fixed but the
+            # SUSTAINED rate (measured over a real 21h window: 779 models/h,
+            # not the ~5,700/h an early short burst suggested) turned out far
+            # too slow to finish ~106k remaining in time. Draws a clean random
+            # 18% of whatever passes the other two filters -- same hash-based
+            # approach as sharding, every worker agrees with no coordination,
+            # sized so the final dataset is an honest random sample of the
+            # qualifying population rather than "whatever order happened to
+            # get processed before the deadline hit" (which would have been
+            # biased toward newer-published models, since that's listing's
+            # own order).
             python sketchfab_scraper.py --detail --shard "${{ matrix.shard }}" \
-              --require-comments --since 2023-09-26 \
+              --require-comments --since 2023-09-26 --sample-pct 18 \
               --delay 1.2 --max-minutes "$this_chunk" \
               | tee /tmp/detail_chunk.log
             rc=$?
