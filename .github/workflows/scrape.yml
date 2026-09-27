@@ -304,14 +304,13 @@ jobs:
           # interpolation -- the CGTrader project's completion step was
           # broken exactly this way (a multi-line value pasted into a JS
           # string literal is a guaranteed syntax error) until it was fixed.
-          PROGRESS_TABLE: ${{ steps.progress.outputs.table }}
           TOTAL_DONE: ${{ steps.progress.outputs.total_done }}
           TOTAL_TARGET: ${{ steps.progress.outputs.total_target }}
           MISSING: ${{ steps.progress.outputs.missing }}
         uses: actions/github-script@v7
         with:
           script: |
-            const title = "Sketchfab scrape complete (18/18 categories)";
+            const title = "Sketchfab scrape: deadline-scoped sample complete";
             const { data: existing } = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
               state: "all", labels: "scrape-complete",
@@ -325,15 +324,24 @@ jobs:
               title,
               labels: ["scrape-complete"],
               body: [
-                "Every category has been fully listed and every discovered",
-                "model has full detail + comments (or is confirmed gone).",
+                "The deadline-scoped target is done: a random 18% sample of",
+                "every model with commentCount > 0 published since 2023-09-26,",
+                "across all 18 categories (see check_completion.py for the",
+                "exact filter -- it reuses sketchfab_scraper.py's own",
+                "load_targets()/_in_random_sample() so this can't drift out",
+                "of sync with what the detail step actually selects).",
                 "",
-                `**${process.env.TOTAL_DONE} / ${process.env.TOTAL_TARGET}** models (${process.env.MISSING} unaccounted for)`,
+                `**${process.env.TOTAL_DONE} / ${process.env.TOTAL_TARGET}** sampled models detailed (${process.env.MISSING} unaccounted for)`,
                 "",
-                process.env.PROGRESS_TABLE,
+                "This is NOT full coverage of the catalog -- listing is still",
+                "incomplete for 15/18 categories, and only a deliberate 18%",
+                "sample of the comments+recency-filtered pool was targeted,",
+                "not the whole ~106k qualifying pool. See the conversation/",
+                "commit history for why (fixed deadline, measured sustained",
+                "rate too slow for the full scope).",
                 "",
                 "The scheduled workflow will keep running every 6h (harmless,",
-                "finishes in well under a minute once nothing is left to do)",
-                "unless disabled from the Actions tab.",
+                "finishes in well under a minute once nothing is left to do",
+                "for this target) unless disabled from the Actions tab.",
               ].join("\n"),
             });
